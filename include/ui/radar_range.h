@@ -29,6 +29,9 @@ constexpr RangePreset kRangePresets[] = {
     {10.0f, 10.0f * kRing3ToOuterKm},
     {15.0f, 15.0f * kRing3ToOuterKm},
     {25.0f, 25.0f * kRing3ToOuterKm},
+    {50.0f, 50.0f * kRing3ToOuterKm},
+    {100.0f, 100.0f * kRing3ToOuterKm},
+    {200.0f, 200.0f * kRing3ToOuterKm},
 };
 
 constexpr size_t kRangePresetCount =
@@ -52,5 +55,44 @@ void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles);
 void formatCurrentRing3Label(char* buf, size_t len);
 /** Reset distance units to km (e.g. with WiFi credential wipe). */
 void unitsReset();
+
+// --- Direct setters (used by the config web page; persist to flash) ---
+void setRangeIndex(uint8_t index);
+void setMiles(bool miles);
+void setRunways(bool on);
+
+/** Coastline/water contour underlay (OSM); off by default. */
+bool showContours();
+void setContours(bool on);
+
+/** Text labels (airport idents, aircraft tags); on by default. */
+bool showLabels();
+void setLabels(bool on);
+
+/** Short beep when the sweep paints an aircraft; off by default. */
+bool beepEnabled();
+void setBeep(bool on);
+
+/** Beep volume 0–100 %. */
+uint8_t beepVolume();
+void setBeepVolume(uint8_t pct);
+
+/** Auto-rotate the radar from the IMU (90° steps); on by default. */
+bool autoRotate();
+void setAutoRotate(bool on);
+
+// --- Sweep + appearance settings (persisted) ---
+/** Sweep revolution period in ms (clamped to a sane range). */
+uint32_t sweepPeriodMs();
+void setSweepPeriodMs(uint32_t ms);
+/** Sweep line colour as 0xRRGGBB. */
+uint32_t sweepColorRgb();
+void setSweepColorRgb(uint32_t rgb);
+/** Aircraft/blip colour as 0xRRGGBB. */
+uint32_t aircraftColorRgb();
+void setAircraftColorRgb(uint32_t rgb);
+/** Display backlight brightness 0–255. */
+uint8_t brightness();
+void setBrightness(uint8_t value);
 
 }  // namespace ui::radar

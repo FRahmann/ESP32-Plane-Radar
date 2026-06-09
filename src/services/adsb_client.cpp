@@ -2,6 +2,8 @@
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <ArduinoJson.h>
 
@@ -15,75 +17,10 @@ namespace {
 
 constexpr char kApiBase[] = "https://opendata.adsb.fi/api/v3/lat/";
 constexpr float kKmPerNm = 1.852f;
-constexpr int kConnectAttemptMs = 200;
-constexpr unsigned long kRequestTimeoutMs = 10000;
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
-PollFn s_poll_fn = nullptr;
-
-void pollNetwork() {
-  if (s_poll_fn != nullptr) {
-    s_poll_fn();
-  }
-}
-
-int performGetWithPoll(HTTPClient& http) {
-  http.setConnectTimeout(kConnectAttemptMs);
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int code = http.GET();
-    if (code > 0) {
-      return code;
-    }
-    if (code != HTTPC_ERROR_CONNECTION_REFUSED &&
-        code != HTTPC_ERROR_NOT_CONNECTED) {
-      return code;
-    }
-    delay(5);
-  }
-  return HTTPC_ERROR_READ_TIMEOUT;
-}
-
-bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
-  WiFiClient* stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    return false;
-  }
-
-  const int content_length = http.getSize();
-  if (content_length > 0) {
-    payload.reserve(static_cast<unsigned>(content_length + 1));
-  }
-
-  uint8_t buffer[512];
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int available = stream->available();
-    if (available > 0) {
-      const int to_read =
-          available > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
-                                                       : available;
-      const int read_bytes = stream->readBytes(buffer, to_read);
-      if (read_bytes > 0) {
-        payload.concat(reinterpret_cast<const char*>(buffer),
-                       static_cast<unsigned>(read_bytes));
-      }
-    }
-    if (content_length > 0 &&
-        static_cast<int>(payload.length()) >= content_length) {
-      break;
-    }
-    if (!http.connected() && stream->available() <= 0) {
-      break;
-    }
-    delay(1);
-  }
-
-  return payload.length() > 0;
-}
+SemaphoreHandle_t s_mutex = nullptr;
 
 float kmToNauticalMiles(float km) { return km / kKmPerNm; }
 
@@ -199,11 +136,30 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
 
 }  // namespace
 
-void setPollFn(PollFn fn) { s_poll_fn = fn; }
+void init() {
+  if (s_mutex == nullptr) {
+    s_mutex = xSemaphoreCreateMutex();
+  }
+}
 
 size_t aircraftCount() { return s_aircraft_count; }
 
 const Aircraft* aircraftList() { return s_aircraft; }
+
+size_t snapshotAircraft(Aircraft* out, size_t max) {
+  if (s_mutex != nullptr) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+  }
+  size_t n = s_aircraft_count;
+  if (n > max) {
+    n = max;
+  }
+  memcpy(out, s_aircraft, n * sizeof(Aircraft));
+  if (s_mutex != nullptr) {
+    xSemaphoreGive(s_mutex);
+  }
+  return n;
+}
 
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
@@ -224,20 +180,15 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     return false;
   }
 
-  http.setTimeout(kRequestTimeoutMs);
-  const int code = performGetWithPoll(http);
+  http.setTimeout(10000);
+  const int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("adsb: HTTP %d\n", code);
     http.end();
     return false;
   }
 
-  String payload;
-  if (!readResponseBodyWithPoll(http, payload)) {
-    Serial.println("adsb: empty response");
-    http.end();
-    return false;
-  }
+  const String payload = http.getString();
   http.end();
 
   JsonDocument doc;
@@ -248,8 +199,18 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   }
 
   JsonArray ac = doc["ac"].as<JsonArray>();
+
+  // Lock only the (fast) list mutation, not the HTTP/parse above, so the
+  // render task on the other core is barely stalled.
+  if (s_mutex != nullptr) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+  }
+
   if (ac.isNull()) {
     s_aircraft_count = 0;
+    if (s_mutex != nullptr) {
+      xSemaphoreGive(s_mutex);
+    }
     return true;
   }
 
@@ -275,6 +236,9 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   }
 
   s_aircraft_count = n;
+  if (s_mutex != nullptr) {
+    xSemaphoreGive(s_mutex);
+  }
   Serial.printf("adsb: %u aircraft\n", static_cast<unsigned>(n));
   return true;
 }

@@ -2,14 +2,26 @@
 
 #include <cstdint>
 
+#include "config.h"
+
 namespace ui::radar {
 
-constexpr int kSize = 240;
+// Geometry was hand-tuned for a 240×240 panel; express it relative to the
+// actual panel size so the same layout scales to 360×360 (ESP32-S3-LCD-1.85)
+// while reproducing the original integers exactly when kSize == 240.
+constexpr int kRefSize = 240;
+constexpr int kSize = config::kDisplayWidth;
 constexpr int kCenterX = kSize / 2;
 constexpr int kCenterY = kSize / 2;
 
+/** Scale a 240-px-reference length to the active panel size. */
+constexpr int scaled(int ref_px) { return ref_px * kSize / kRefSize; }
+constexpr float scaledf(float ref_px) {
+  return ref_px * static_cast<float>(kSize) / static_cast<float>(kRefSize);
+}
+
 /** Outermost grid ring (inside edge labels). */
-constexpr int kGridOuterRadius = 107;
+constexpr int kGridOuterRadius = scaled(107);
 
 /** N: offset from top edge (top_center, negative = up). */
 constexpr int kCardinalNorthOffsetY = -1;
@@ -17,50 +29,50 @@ constexpr int kCardinalNorthOffsetY = -1;
 constexpr int kCardinalSouthOffsetY = 3;
 
 /** Gap between scale label right edge and outer ring on the east spoke (px). */
-constexpr int kScaleGapFromOuterRing = 6;
+constexpr int kScaleGapFromOuterRing = scaled(6);
 
 /** Target cap height (px) for N/S/E/W. */
-constexpr int kCardinalLabelHeightPx = 14;
+constexpr int kCardinalLabelHeightPx = scaled(14);
 /** Scale label is this many px shorter than cardinals. */
-constexpr int kScaleBelowCardinalPx = 3;
+constexpr int kScaleBelowCardinalPx = scaled(3);
 
 constexpr int kRingCount = 4;
 
 /** Shared grid stroke: drawWideLine half-width (~2 px total); rings use the same px count. */
-constexpr float kGridStrokeHalfWidth = 1.0f;
+constexpr float kGridStrokeHalfWidth = scaledf(1.0f);
 
-constexpr int kCenterDotRadius = 2;
+constexpr int kCenterDotRadius = scaled(2);
 
 /** Filled aircraft symbol (nose triangle). */
-constexpr int kAircraftNoseLenPx = 8;
-constexpr int kAircraftTailLenPx = 3;
-constexpr int kAircraftTailHalfPx = 4;
+constexpr int kAircraftNoseLenPx = scaled(8);
+constexpr int kAircraftTailLenPx = scaled(3);
+constexpr int kAircraftTailHalfPx = scaled(4);
 /** Track vector: ground distance covered in this many seconds at current gs. */
 constexpr float kAircraftTrackHorizonSec = 60.0f;
 /** Minimum visible vector when gs > 0 (px). */
-constexpr int kAircraftSpeedLineMinPx = 2;
+constexpr int kAircraftSpeedLineMinPx = scaled(2);
 /** Track line length uses this outer_km, not the active range preset. */
 constexpr float kAircraftTrackRefOuterKm = 13.3f;
 /** Shorter than full 60 s horizon at ref scale; ×1.5 length boost applied. */
 constexpr float kAircraftTrackLengthScale = 1.5f / 5.0f;
 /** drawWideLine half-width for speed vectors (~2 px total). */
-constexpr float kAircraftTrackLineHalfWidth = 1.0f;
+constexpr float kAircraftTrackLineHalfWidth = scaledf(1.0f);
 
-constexpr float kRunwayLineWidthPx = 2.0f;
+constexpr float kRunwayLineWidthPx = scaledf(2.0f);
 constexpr float kRunwayLineHalfWidth = kRunwayLineWidthPx * 0.5f;
 constexpr int kRunwayLabelHeightPx = kCardinalLabelHeightPx;
-constexpr int kRunwayLabelGapPx = 3;
+constexpr int kRunwayLabelGapPx = scaled(3);
 /** Gap from triangle edge to tag block (px). */
-constexpr int kAircraftLabelGapPx = 1;
+constexpr int kAircraftLabelGapPx = scaled(1);
 /** Keep symbol centroid inside outer ring by at least this inset (px). */
 constexpr int kAircraftInsideRingInsetPx =
     kAircraftNoseLenPx + kAircraftTailHalfPx + 1;
 
 /** Beyond-ring traffic: bearing cues on screen rim (correct direction, fixed radius). */
-constexpr int kBeyondRingDotRadiusPx = 4;
-constexpr int kBeyondRingScreenMarginPx = 2;
+constexpr int kBeyondRingDotRadiusPx = scaled(4);
+constexpr int kBeyondRingScreenMarginPx = scaled(2);
 /** Target cap height (px) for aircraft tags (bold, slightly above scale label). */
-constexpr int kAircraftTagLabelHeightPx = 13;
+constexpr int kAircraftTagLabelHeightPx = scaled(13);
 
 /** RGB565 palette targets (applied in initPalette). */
 constexpr uint8_t kBgR = 4;

@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WiFiMulti.h>
 
 #include <cstdio>
 
@@ -15,6 +16,7 @@
 
 #include "config.h"
 #include "services/radar_location.h"
+#include "services/wifi_store.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
@@ -24,6 +26,9 @@ volatile bool s_boot_is_down = false;
 volatile unsigned long s_boot_down_ms = 0;
 bool s_long_press_handled = false;
 bool s_boot_interrupt_attached = false;
+/** Guard: ignore a held BOOT until it has been seen released once (avoids a
+ *  power-on GPIO0 glitch / stale ISR timestamp triggering a WiFi wipe). */
+bool s_boot_release_seen = false;
 
 void IRAM_ATTR onBootButtonIsr() {
   const bool down = digitalRead(config::kBootPin) == LOW;
@@ -59,13 +64,6 @@ constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
 
 bool s_force_config_portal = false;
-WiFiManager s_wm;
-bool s_wm_configured = false;
-
-void ensureWifiManager();
-void startLanWebPortal();
-void stopLanWebPortal();
-bool wifiLinkUp();
 
 constexpr int kCoordParamLen = 20;
 constexpr char kCoordInputAttrs[] =
@@ -155,30 +153,15 @@ bool consumeForceConfigPortal() {
   return true;
 }
 
-bool storedWifiCredentials() {
-  wifi_mode_t mode = WIFI_MODE_NULL;
-  if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
-    WiFi.mode(WIFI_STA);
-    delay(50);
-  }
-
-  wifi_config_t conf = {};
-  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
-    return false;
-  }
-  return conf.sta.ssid[0] != '\0';
-}
-
 void eraseWifiCredentials() {
-  stopLanWebPortal();
   WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_OFF);
   delay(100);
 
-  ensureWifiManager();
   WiFi.persistent(true);
-  s_wm.resetSettings();
-  s_wm.erase();
+  WiFiManager wm;
+  wm.resetSettings();
+  wm.erase();
   WiFi.disconnect(true, true);
   WiFi.persistent(false);
 
@@ -189,6 +172,7 @@ void eraseWifiCredentials() {
 void resetWifiCredentials() {
   markForceConfigPortal();
   eraseWifiCredentials();
+  services::wifi_store::clear();  // built-in default is re-seeded on next init()
   services::location::clear();
   ui::radar::unitsReset();
   Serial.println("WiFi credentials, location, and units cleared");
@@ -209,51 +193,18 @@ void onConfigPortalApStarted(WiFiManager*) {
 #endif
 }
 
+void configureWifiManager(WiFiManager& wm) {
+  wm.setConfigPortalTimeout(config::kWifiPortalTimeoutSec);
+  wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                         IPAddress(255, 255, 255, 0));
+  wm.setHostname(config::kPortalHostname);
+  wm.setAPCallback(onConfigPortalApStarted);
+  attachPortalParams(wm);
+}
+
 bool wifiLinkUp() {
   return WiFi.status() == WL_CONNECTED &&
          WiFi.localIP() != IPAddress(0, 0, 0, 0);
-}
-
-void ensureWifiManager() {
-  if (s_wm_configured) {
-    return;
-  }
-  s_wm.setConfigPortalTimeout(config::kWifiPortalTimeoutSec);
-  s_wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                           IPAddress(255, 255, 255, 0));
-  s_wm.setHostname(config::kPortalHostname);
-  s_wm.setAPCallback(onConfigPortalApStarted);
-  attachPortalParams(s_wm);
-  s_wm_configured = true;
-}
-
-void startLanWebPortal() {
-  if (!wifiLinkUp() || s_wm.getWebPortalActive() ||
-      s_wm.getConfigPortalActive()) {
-    return;
-  }
-  refreshPortalParamDefaults();
-  WiFi.mode(WIFI_STA);
-  s_wm.setConfigPortalBlocking(false);
-#ifdef WM_MDNS
-  MDNS.end();
-  if (MDNS.begin(config::kPortalHostname)) {
-    MDNS.addService("http", "tcp", 80);
-  }
-#endif
-  s_wm.startWebPortal();
-  Serial.printf("LAN config: http://%s.local or http://%s\n",
-                config::kPortalHostname, WiFi.localIP().toString().c_str());
-}
-
-void stopLanWebPortal() {
-  if (!s_wm.getWebPortalActive()) {
-    return;
-  }
-  s_wm.stopWebPortal();
-#ifdef WM_MDNS
-  MDNS.end();
-#endif
 }
 
 void prepareSta() {
@@ -313,31 +264,54 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
   return false;
 }
 
-bool connectSavedNetwork(bool show_ui) {
-  if (!storedWifiCredentials()) {
+// Connect to whichever stored network (services::wifi_store) is in range,
+// using WiFiMulti — so the device roams across saved locations.
+bool connectMulti(bool show_ui) {
+  const size_t n = services::wifi_store::count();
+  if (n == 0) {
     return false;
   }
-
-  ensureWifiManager();
-  const String ssid = s_wm.getWiFiSSID();
-  if (ssid.length() == 0) {
-    return false;
+  WiFiMulti multi;
+  const services::wifi_store::Net* nets = services::wifi_store::list();
+  for (size_t i = 0; i < n; ++i) {
+    multi.addAP(nets[i].ssid, nets[i].pass);
   }
-  const String pass = s_wm.getWiFiPass();
-  return tryConnectWithUi(ssid, pass, show_ui);
+  prepareSta();
+  if (show_ui) {
+    statusScreenConnectingBegin("known networks");
+  }
+  const unsigned long deadline =
+      millis() + config::kWifiConnectAttemptMs * config::kWifiConnectAttempts;
+  while (millis() < deadline) {
+    bootButtonPollLongPress();
+    if (multi.run(7000) == WL_CONNECTED && wifiLinkUp()) {
+      return true;
+    }
+    if (show_ui) {
+      statusScreenConnectingTick();
+    }
+  }
+  return wifiLinkUp();
 }
 
-bool openConfigPortal() {
-  stopLanWebPortal();
+// After a successful connect, remember the network (SSID + PSK) in the store.
+void addConnectedToStore() {
+  const String ssid = WiFi.SSID();
+  if (ssid.length() > 0) {
+    services::wifi_store::add(ssid.c_str(), WiFi.psk().c_str());
+  }
+}
+
+bool openConfigPortal(WiFiManager& wm) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(50);
   statusScreenPortal();
-  s_wm.setConfigPortalBlocking(false);
-  s_wm.startConfigPortal(config::kPortalApName);
-  while (s_wm.getConfigPortalActive()) {
+  wm.setConfigPortalBlocking(false);
+  wm.startConfigPortal(config::kPortalApName);
+  while (wm.getConfigPortalActive()) {
     bootButtonPollLongPress();
-    if (s_wm.process()) {
+    if (wm.process()) {
       return true;
     }
     delay(10);
@@ -377,27 +351,33 @@ bool bootButtonConsumeTap() {
 }
 
 void bootButtonPollLongPress() {
-  if (wifiBootButtonPressed()) {
-    portENTER_CRITICAL(&s_boot_mux);
-    if (!s_boot_is_down) {
-      s_boot_is_down = true;
-      s_boot_down_ms = millis();
-    }
-    const unsigned long down_ms = s_boot_down_ms;
-    portEXIT_CRITICAL(&s_boot_mux);
+  // Self-contained debounce/timing: the press start is measured by the poll
+  // itself on each HIGH->LOW edge, never from the (async, glitch-prone) ISR
+  // timestamp — otherwise a single noise dip read as LOW with a stale start
+  // time would instantly look like a 3 s hold and wipe WiFi.
+  static bool prev_low = false;
+  static unsigned long press_start = 0;
+  const bool low = wifiBootButtonPressed();
+  const unsigned long now = millis();
 
-    if (!s_long_press_handled &&
-        millis() - down_ms >= config::kBootResetHoldMs) {
+  if (low && !prev_low) {
+    press_start = now;  // fresh press edge
+  } else if (low && prev_low) {
+#if !defined(RADAR_BOARD_S3LCD185)
+    // BOOT-hold WiFi reset — disabled on the S3-LCD-1.85, whose BOOT line reads
+    // spurious sustained-LOWs under WiFi load. Use the web "reset" button there.
+    if (s_boot_release_seen && !s_long_press_handled &&
+        now - press_start >= config::kBootResetHoldMs) {
       s_long_press_handled = true;
       Serial.println("BOOT held — resetting WiFi");
       wifiResetCredentialsAndReboot();
     }
-  } else {
-    portENTER_CRITICAL(&s_boot_mux);
-    s_boot_is_down = false;
-    portEXIT_CRITICAL(&s_boot_mux);
+#endif
+  } else {  // released / HIGH
     s_long_press_handled = false;
+    s_boot_release_seen = true;  // a real release — long-press now allowed
   }
+  prev_low = low;
 }
 
 void wifiResetCredentialsAndReboot() {
@@ -410,27 +390,12 @@ void wifiResetCredentialsAndReboot() {
 bool wifiReconnect() {
   initBootButton();
   Serial.println("WiFi reconnecting...");
-  return connectSavedNetwork(true);
-}
-
-void wifiLoop() {
-  ensureWifiManager();
-  if (wifiLinkUp()) {
-    if (!s_wm.getWebPortalActive() && !s_wm.getConfigPortalActive()) {
-      startLanWebPortal();
-    }
-    if (s_wm.getWebPortalActive() || s_wm.getConfigPortalActive()) {
-      bootButtonPollLongPress();
-      s_wm.process();
-    }
-  } else {
-    stopLanWebPortal();
-  }
+  return connectMulti(true) && wifiLinkUp();
 }
 
 bool wifiSetupConnect() {
   initBootButton();
-  ensureWifiManager();
+  services::wifi_store::init();  // load known networks (+ seed built-in default)
 
   const bool force_portal = consumeForceConfigPortal();
   WiFi.setAutoReconnect(false);
@@ -441,9 +406,13 @@ bool wifiSetupConnect() {
     delay(100);
   }
 
+  WiFiManager wm;
+  configureWifiManager(wm);
+
   if (force_portal) {
     Serial.println("Opening WiFi setup portal (after reset)");
-    if (openConfigPortal() && wifiLinkUp()) {
+    if (openConfigPortal(wm) && wifiLinkUp()) {
+      addConnectedToStore();
       WiFi.setAutoReconnect(true);
       Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str());
@@ -463,20 +432,18 @@ bool wifiSetupConnect() {
     return true;
   }
 
-  if (storedWifiCredentials() && connectSavedNetwork(true)) {
+  // Try every known network (WiFiMulti) — connects to whichever is in range.
+  if (connectMulti(true) && wifiLinkUp()) {
     WiFi.setAutoReconnect(true);
     Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());
     return true;
   }
 
-  if (storedWifiCredentials()) {
-    Serial.println("Saved WiFi could not connect — opening setup portal");
-  } else {
-    Serial.println("No saved WiFi — opening setup portal");
-  }
+  Serial.println("No known network reachable — opening setup portal");
 
-  if (openConfigPortal() && wifiLinkUp()) {
+  if (openConfigPortal(wm) && wifiLinkUp()) {
+    addConnectedToStore();
     WiFi.setAutoReconnect(true);
     Serial.printf("Connected: %s  IP %s\n", WiFi.SSID().c_str(),
                   WiFi.localIP().toString().c_str());

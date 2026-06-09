@@ -7,11 +7,15 @@
 
 #include "data/large_airports.h"
 #include "hardware/display_font.h"
+#include "services/custom_airfields.h"
+#include "services/map_contours.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/radar_theme.h"
 
+#if !defined(RADAR_BOARD_S3LCD185)
 namespace fonts = lgfx::v1::fonts;
+#endif
 
 namespace ui::runway {
 namespace {
@@ -243,6 +247,45 @@ void drawAirportLabel(lgfx::LGFXBase& gfx,
   drawBoldRunwayLabel(gfx, ap.ident, lx, ly);
 }
 
+// Airfields fetched from OpenStreetMap around the centre: teal runway lines +
+// aerodrome ident labels (only for aerodromes inside the outer ring).
+void drawOnlineAirfields(lgfx::LGFXBase& gfx) {
+  static services::airfields::Runway rws[services::airfields::kMaxRunways];
+  static services::airfields::Aerodrome ads[services::airfields::kMaxAerodromes];
+  const size_t rn =
+      services::airfields::snapshotRunways(rws, services::airfields::kMaxRunways);
+  const size_t an = services::airfields::snapshotAerodromes(
+      ads, services::airfields::kMaxAerodromes);
+  if (rn == 0 && an == 0) {
+    return;
+  }
+
+  for (size_t i = 0; i < rn; ++i) {
+    const data::large_airports::Runway rw{0, rws[i].le_lat_e7, rws[i].le_lon_e7,
+                                          rws[i].he_lat_e7, rws[i].he_lon_e7, 0};
+    drawRunwayLine(gfx, rw);
+  }
+
+  if (an == 0 || !radar::showLabels()) {
+    return;
+  }
+  const int grid_r = radar::kGridOuterRadius;
+  initRunwayLabelStyle(gfx);
+  applyRunwayLabelStyle(gfx);
+  for (size_t i = 0; i < an; ++i) {
+    int ax = 0;
+    int ay = 0;
+    latLonToScreen(e7ToDeg(ads[i].lat_e7), e7ToDeg(ads[i].lon_e7), &ax, &ay);
+    if (distSqFromCenter(ax, ay) > grid_r * grid_r) {
+      continue;  // outside the radar ring — skip to avoid rim clutter
+    }
+    int lx = 0;
+    int ly = 0;
+    offsetLabelFromCenter(ax, ay, &lx, &ly);
+    drawBoldRunwayLabel(gfx, ads[i].ident, lx, ly);
+  }
+}
+
 }  // namespace
 
 void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
@@ -284,14 +327,54 @@ void drawLargeAirportRunways(lgfx::LGFXBase& gfx) {
     }
   }
 
-  if (label_count == 0) {
+  if (label_count > 0 && radar::showLabels()) {
+    initRunwayLabelStyle(gfx);
+    applyRunwayLabelStyle(gfx);
+    for (size_t i = 0; i < label_count; ++i) {
+      drawAirportLabel(gfx, data::large_airports::kAirports[label_airports[i]]);
+    }
+  }
+
+  drawOnlineAirfields(gfx);
+}
+
+void drawMapContours(lgfx::LGFXBase& gfx) {
+  if (!radar::showContours()) {
+    return;
+  }
+  static services::contours::PolySpan polys[services::contours::kMaxPolys];
+  static services::contours::Point pts[services::contours::kMaxPoints];
+  size_t npt = 0;
+  const size_t np = services::contours::snapshot(
+      polys, services::contours::kMaxPolys, pts, services::contours::kMaxPoints,
+      &npt);
+  if (np == 0) {
     return;
   }
 
-  initRunwayLabelStyle(gfx);
-  applyRunwayLabelStyle(gfx);
-  for (size_t i = 0; i < label_count; ++i) {
-    drawAirportLabel(gfx, data::large_airports::kAirports[label_airports[i]]);
+  const uint16_t col = gfx.color565(64, 132, 210);  // water blue (visible on bg)
+  for (size_t i = 0; i < np; ++i) {
+    const uint16_t start = polys[i].start;
+    const uint16_t cnt = polys[i].count;
+    int px = 0, py = 0;
+    bool have_prev = false;
+    for (uint16_t k = 0; k < cnt; ++k) {
+      const size_t idx = start + k;
+      if (idx >= npt) {
+        break;
+      }
+      int x = 0, y = 0;
+      latLonToScreen(e7ToDeg(pts[idx].lat_e7), e7ToDeg(pts[idx].lon_e7), &x, &y);
+      if (have_prev && segmentIntersectsDisc(px, py, x, y)) {
+        int x0 = px, y0 = py, x1 = x, y1 = y;
+        clipPointToOuterRing(x0, y0, &x1, &y1);
+        clipPointToOuterRing(x1, y1, &x0, &y0);
+        gfx.drawLine(x0, y0, x1, y1, col);
+      }
+      px = x;
+      py = y;
+      have_prev = true;
+    }
   }
 }
 

@@ -11,7 +11,9 @@
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 
+#if !defined(RADAR_BOARD_S3LCD185)
 namespace fonts = lgfx::v1::fonts;
+#endif
 
 namespace {
 
@@ -20,9 +22,11 @@ const int kCenterX = config::kDisplayWidth / 2;
 const int kCenterY = config::kDisplayHeight / 2;
 
 constexpr int kSpinnerDotCount = 10;
-constexpr int kSpinnerRadius = 113;
-constexpr int kSpinnerDotRadius = 2;
-constexpr int kSpinnerEraseRadius = 4;
+// Spinner/erase sizes are relative to panel width (tuned at 240 px) so they
+// sit near the rim on the 360 px ESP32-S3 panel too.
+const int kSpinnerRadius = config::kDisplayWidth * 113 / 240;
+const int kSpinnerDotRadius = config::kDisplayWidth * 2 / 240;
+const int kSpinnerEraseRadius = config::kDisplayWidth * 4 / 240;
 constexpr float kSpinnerStepDeg = 6.0f;
 
 struct SpinnerDot {
@@ -33,7 +37,7 @@ struct SpinnerDot {
 
 char s_connecting_ssid[33];
 char s_ssid_line[33];
-constexpr int kConnectingTextMaxWidthPx = 220;
+const int kConnectingTextMaxWidthPx = config::kDisplayWidth * 220 / 240;
 float s_spinner_angle_deg = -90.0f;
 SpinnerDot s_spinner_dots[kSpinnerDotCount];
 bool s_connecting_text_drawn = false;
@@ -46,6 +50,47 @@ constexpr auto& kPortalGfxBody = fonts::FreeSansBold12pt7b;
 constexpr auto& kPortalGfxEmphasis = fonts::FreeSansBold18pt7b;
 constexpr auto& kConnectingGfxDetail = fonts::FreeSans9pt7b;
 
+// Render target. On the S3/ST77916 (QSPI) panel, many small *direct* writes are
+// unreliable (a documented Panel_SH8601Z quirk) — they garble text — while a
+// single pushSprite is solid. So status screens are composed into an off-screen
+// sprite and blitted in one pass, exactly like the radar. The C3 draws direct.
+lgfx::LovyanGFX* s_gfx = &tft;
+
+#if defined(RADAR_BOARD_S3LCD185)
+LGFX_Sprite s_canvas(&tft);
+bool s_canvas_ready = false;
+
+bool ensureCanvas() {
+  if (!s_canvas_ready) {
+    s_canvas.setColorDepth(16);
+    s_canvas.setPsram(true);
+    s_canvas_ready =
+        s_canvas.createSprite(config::kDisplayWidth, config::kDisplayHeight);
+  }
+  return s_canvas_ready;
+}
+#endif
+
+void canvasBegin() {
+#if defined(RADAR_BOARD_S3LCD185)
+  if (ensureCanvas()) {
+    s_gfx = &s_canvas;
+    displayFontEnsureLoaded(s_canvas);
+    return;
+  }
+#endif
+  s_gfx = &tft;
+}
+
+void canvasPush() {
+#if defined(RADAR_BOARD_S3LCD185)
+  if (s_gfx == &s_canvas) {
+    s_canvas.pushSprite(0, 0);
+  }
+#endif
+  s_gfx = &tft;
+}
+
 struct TextLine {
   const char* text;
   float vlw_size;
@@ -53,27 +98,28 @@ struct TextLine {
 };
 
 int lineHeightGfx(const lgfx::GFXfont* font) {
-  displayFontSetBitmap(tft, font);
-  return tft.fontHeight();
+  displayFontSetBitmap(*s_gfx, font);
+  return s_gfx->fontHeight();
 }
 
 int lineHeightVlw(float size) {
-  displayFontSetSmoothSize(tft, size);
-  return tft.fontHeight();
+  displayFontSetSmoothSize(*s_gfx, size);
+  return s_gfx->fontHeight();
 }
 
 void applyLineStyle(const TextLine& line) {
   if (displayFontIsSmooth()) {
-    displayFontSetSmoothSize(tft, line.vlw_size);
+    displayFontSetSmoothSize(*s_gfx, line.vlw_size);
   } else {
-    displayFontSetBitmap(tft, line.gfx_font);
+    displayFontSetBitmap(*s_gfx, line.gfx_font);
   }
 }
 
 void drawTextBlock(uint16_t bg, uint16_t fg, const TextLine* lines, size_t count) {
-  tft.fillScreen(bg);
-  tft.setTextColor(fg, bg);
-  tft.setTextDatum(textdatum_t::middle_center);
+  canvasBegin();
+  s_gfx->fillScreen(bg);
+  s_gfx->setTextColor(fg, bg);
+  s_gfx->setTextDatum(textdatum_t::middle_center);
 
   int total_h = 0;
   for (size_t i = 0; i < count; ++i) {
@@ -93,18 +139,19 @@ void drawTextBlock(uint16_t bg, uint16_t fg, const TextLine* lines, size_t count
     const int h =
         displayFontIsSmooth() ? lineHeightVlw(lines[i].vlw_size)
                               : lineHeightGfx(lines[i].gfx_font);
-    tft.drawString(lines[i].text, kCenterX, y + h / 2);
+    s_gfx->drawString(lines[i].text, kCenterX, y + h / 2);
     y += h + kLineGap;
   }
+  canvasPush();
 }
 
 constexpr float kConnectingDetailVlw = 0.92f;
 
 void applyConnectingDetailStyle() {
   if (displayFontIsSmooth()) {
-    displayFontSetSmoothSize(tft, kConnectingDetailVlw);
+    displayFontSetSmoothSize(*s_gfx, kConnectingDetailVlw);
   } else {
-    displayFontSetBitmap(tft, &kConnectingGfxDetail);
+    displayFontSetBitmap(*s_gfx, &kConnectingGfxDetail);
   }
 }
 
@@ -113,14 +160,14 @@ void fitSsidLine() {
   strncpy(s_ssid_line, s_connecting_ssid, sizeof(s_ssid_line) - 1);
   s_ssid_line[sizeof(s_ssid_line) - 1] = '\0';
   applyConnectingDetailStyle();
-  if (tft.textWidth(s_ssid_line) <= kConnectingTextMaxWidthPx) {
+  if (s_gfx->textWidth(s_ssid_line) <= kConnectingTextMaxWidthPx) {
     return;
   }
   const size_t len = strlen(s_connecting_ssid);
   for (size_t n = len; n > 0; --n) {
     snprintf(s_ssid_line, sizeof(s_ssid_line), "%.*s…", static_cast<int>(n),
              s_connecting_ssid);
-    if (tft.textWidth(s_ssid_line) <= kConnectingTextMaxWidthPx) {
+    if (s_gfx->textWidth(s_ssid_line) <= kConnectingTextMaxWidthPx) {
       return;
     }
   }
@@ -129,23 +176,23 @@ void fitSsidLine() {
 }
 
 void drawConnectingText() {
-  tft.fillScreen(config::kColorBlack);
+  s_gfx->fillScreen(config::kColorBlack);
 
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.setTextColor(config::kTextOnBlack, config::kColorBlack);
+  s_gfx->setTextDatum(textdatum_t::middle_center);
+  s_gfx->setTextColor(config::kTextOnBlack, config::kColorBlack);
 
   applyConnectingDetailStyle();
-  const int detail_h = tft.fontHeight();
+  const int detail_h = s_gfx->fontHeight();
   const int total_h = detail_h * 2 + kLineGap;
   const int block_top = (config::kDisplayHeight - total_h) / 2;
   constexpr int kPanelPadY = 8;
-  tft.fillRect(kCenterX - kConnectingTextMaxWidthPx / 2, block_top - kPanelPadY,
+  s_gfx->fillRect(kCenterX - kConnectingTextMaxWidthPx / 2, block_top - kPanelPadY,
                kConnectingTextMaxWidthPx, total_h + kPanelPadY * 2, config::kColorBlack);
 
   int y = block_top;
-  tft.drawString("Connecting to", kCenterX, y + detail_h / 2);
+  s_gfx->drawString("Connecting to", kCenterX, y + detail_h / 2);
   y += detail_h + kLineGap;
-  tft.drawString(s_ssid_line, kCenterX, y + detail_h / 2);
+  s_gfx->drawString(s_ssid_line, kCenterX, y + detail_h / 2);
 
   s_connecting_text_drawn = true;
 }
@@ -155,7 +202,7 @@ void eraseSpinnerDots() {
     if (!s_spinner_dots[i].drawn) {
       continue;
     }
-    tft.fillCircle(s_spinner_dots[i].x, s_spinner_dots[i].y, kSpinnerEraseRadius,
+    s_gfx->fillCircle(s_spinner_dots[i].x, s_spinner_dots[i].y, kSpinnerEraseRadius,
                    config::kColorBlack);
     s_spinner_dots[i].drawn = false;
   }
@@ -171,8 +218,8 @@ void drawSpinnerDots() {
     const int y = kCenterY + static_cast<int>(std::lround(std::sin(a) * kSpinnerRadius));
 
     const int fade = 255 - i * 22;
-    const uint16_t color = tft.color565(0, fade, 0);
-    tft.fillSmoothCircle(x, y, kSpinnerDotRadius, color);
+    const uint16_t color = s_gfx->color565(0, fade, 0);
+    s_gfx->fillSmoothCircle(x, y, kSpinnerDotRadius, color);
 
     s_spinner_dots[i].x = x;
     s_spinner_dots[i].y = y;
@@ -192,11 +239,14 @@ void statusScreenConnectingBegin(const char* ssid) {
     dot.drawn = false;
   }
   s_connecting_text_drawn = false;
+  canvasBegin();
   drawConnectingText();
   drawSpinnerDots();
+  canvasPush();
 }
 
 void statusScreenConnectingTick() {
+  canvasBegin();
   if (!s_connecting_text_drawn) {
     drawConnectingText();
   }
@@ -206,6 +256,7 @@ void statusScreenConnectingTick() {
     s_spinner_angle_deg -= 360.0f;
   }
   drawSpinnerDots();
+  canvasPush();
 }
 
 void statusScreenPortal() {
